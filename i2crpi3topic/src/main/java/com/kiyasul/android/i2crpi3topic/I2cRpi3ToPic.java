@@ -1,17 +1,18 @@
-package com.kiyasul.android.i2crpi3topic;
+package com.kiyasul.android.fiftyx;
 
 import android.os.Handler;
 import android.util.Log;
+
 import com.google.android.things.pio.I2cDevice;
 import com.google.android.things.pio.PeripheralManagerService;
 import com.google.firebase.database.DatabaseReference;
 import com.google.firebase.database.FirebaseDatabase;
+
 import java.io.IOException;
 
 /**
  * Created by kiyasul on 02/01/18.
  */
-
 public class I2cRpi3ToPic implements Runnable{
 
     private static final String TAG = "SingletonClass";
@@ -48,7 +49,9 @@ public class I2cRpi3ToPic implements Runnable{
     private static final int ADC3_ADDRESS = 0x07;
     private static final int ADC4_ADDRESS = 0x09;
     private static final int ADC5_ADDRESS = 0x0b;
-    private static final int ADC_TEMP_DIE = 0x0d;
+
+    // ## Internal Temp Tested Successfully ## //
+    // private static final int ADC_TEMP_DIE = 0x0d;
 
     /**
      * Firebase reference
@@ -58,16 +61,20 @@ public class I2cRpi3ToPic implements Runnable{
     DatabaseReference mADC3 = null;
     DatabaseReference mADC4 = null;
     DatabaseReference mADC5 = null;
-    DatabaseReference mADTD = null;
 
     /**
-     * Values from the ADC Channels
+     *  Converted Values from the ADC Channels (Byte to Int)
      */
-    int adcA5 ;
-    int adcC3 ;
-    int adcC4 ;
-    int adcC5 ;
-    int adcTmpDie ;
+    private int adcA5 ;
+    private int adcC3 ;
+    private int adcC4 ;
+    private int adcC5 ;
+
+    /**
+     *  Analog Channel to which TMP36 sensor is connected
+     */
+    private int TMP36_CHANNEL;
+    private float TMP36_VALUE;
 
     // Private Constructor
     private I2cRpi3ToPic() {
@@ -97,12 +104,15 @@ public class I2cRpi3ToPic implements Runnable{
      * Setup Firebase Reference for this class
      * Only ADC references from Firebase
      */
-    public void setupFirebaseADCReferences(String ADA5IN, String ADC3IN, String ADC4IN, String ADC5IN, String ADCTDIN){
-        mADA5 = Firebase.child(ADA5IN.trim());
-        mADC3 = Firebase.child(ADC3IN.trim());
-        mADC4 = Firebase.child(ADC4IN.trim());
-        mADC5 = Firebase.child(ADC5IN.trim());
-        mADTD = Firebase.child(ADCTDIN.trim());
+    public void setupFirebaseADCReferences(String ADA5IN, String ADC3IN, String ADC4IN, String ADC5IN, int TMP36IN){
+
+         mADA5 = Firebase.child(ADA5IN.trim());
+         mADC3 = Firebase.child(ADC3IN.trim());
+         mADC4 = Firebase.child(ADC4IN.trim());
+         mADC5 = Firebase.child(ADC5IN.trim());
+
+         TMP36_CHANNEL = (TMP36IN >= 1 && TMP36IN <= 4) ? TMP36IN : 1;
+
     }
 
     /**
@@ -211,11 +221,6 @@ public class I2cRpi3ToPic implements Runnable{
         return adcC5;
     }
 
-    public int readA2DChannelTempDie() throws IOException {
-
-        adcTmpDie = readA2DChannelTempDie(mI2cToPicDevice,ADC_TEMP_DIE );
-        return adcTmpDie;
-    }
 
     /**
      *
@@ -328,12 +333,6 @@ public class I2cRpi3ToPic implements Runnable{
         return byteToInt(data);
     }
 
-    private int readA2DChannelTempDie(I2cDevice device, int startAddress) throws IOException {
-        // Read three consecutive register values
-        byte[] data = new byte[2];
-        device.readRegBuffer(startAddress, data, data.length);
-        return byteToInt(data);
-    }
 
     /**
      *
@@ -368,6 +367,11 @@ public class I2cRpi3ToPic implements Runnable{
         return dac1OutputValue;
     }
 
+    /**
+     *
+     * @param byte_value - byte value from the I2C read api
+     * @return - byte value converted to int
+     */
     private int byteToInt(byte[] byte_value){
 
         return ((byte_value[1] & 0xff) << 8) | (byte_value[0] & 0xff);
@@ -385,12 +389,18 @@ public class I2cRpi3ToPic implements Runnable{
         }
     }
 
+    /**
+     * call on destroy() method - for best practices
+     */
     public void stopADCThread(){
         if(mHandler != null){
             mEnabled = false;
         }
     }
 
+    /**
+     * Thread kicks off
+     */
     @Override
     public void run() {
 
@@ -402,36 +412,95 @@ public class I2cRpi3ToPic implements Runnable{
             readA2DChannelC3();
             readA2DChannelC4();
             readA2DChannelC5();
-            readA2DChannelTempDie();
         } catch (IOException e) {
             e.printStackTrace();
         }
 
+        // Loop program
         loop();
     }
 
     private void loop(){
 
-        Log.d(TAG,"ADC A5   = " + String.valueOf(adcA5));
-        mADA5.setValue(adcA5);
+        calibrateAndUpdateFirebase();
 
-        Log.d(TAG,"ADC C3   = " + String.valueOf(adcC3));
-        mADC3.setValue(adcC3);
-
-        Log.d(TAG,"ADC C4   = " + String.valueOf(adcC4));
-        mADC4.setValue(adcC4);
-
-        Log.d(TAG,"ADC C5   = " + String.valueOf(adcC5));
-        mADC5.setValue(adcC5);
-
-        Log.d(TAG,"ADC TMP_DIE   = " + String.valueOf(adcTmpDie));
-        mADTD.setValue(adcTmpDie);
-
-        // Loop Program
+        // handler to loop in the specified delay
         mHandler.postDelayed(this, POLLING_DELAY_DEFAULT);
     }
 
-    public int getAdcA5() { return adcA5; }
+    /**
+     * Case statements based on the selection of the TMP36 analog channel
+     */
+    private void calibrateAndUpdateFirebase() {
+
+       switch (TMP36_CHANNEL){
+           case 1:
+               TMP36_VALUE = calibrateTMP36(adcA5);
+               mADA5.setValue(TMP36_VALUE);
+               mADC3.setValue(adcC3);
+               mADC4.setValue(adcC4);
+               mADC5.setValue(adcC5);
+               logDebugADC();
+               break;
+           case 2:
+               TMP36_VALUE = calibrateTMP36(adcC3);
+               mADA5.setValue(adcA5);
+               mADC3.setValue(TMP36_VALUE);
+               mADC4.setValue(adcC4);
+               mADC5.setValue(adcC5);
+               logDebugADC();
+               break;
+           case 3:
+               TMP36_VALUE = calibrateTMP36(adcC4);
+               mADA5.setValue(adcA5);
+               mADC3.setValue(adcC3);
+               mADC4.setValue(TMP36_VALUE);
+               mADC5.setValue(adcC5);
+               logDebugADC();
+               break;
+           case 4:
+               TMP36_VALUE = calibrateTMP36(adcC5);
+               mADA5.setValue(adcA5);
+               mADC3.setValue(adcC3);
+               mADC4.setValue(adcC4);
+               mADC5.setValue(TMP36_VALUE);
+               logDebugADC();
+               break;
+           default:
+               TMP36_VALUE = calibrateTMP36(adcA5);
+               mADA5.setValue(TMP36_VALUE);
+               mADC3.setValue(adcC3);
+               mADC4.setValue(adcC4);
+               mADC5.setValue(adcC5);
+               logDebugADC();
+       }
+    }
+
+    /**
+     *
+     * @param adc_value - uncalibrated TMP36 adc_value
+     * @return - calibrated value in float (°C)
+     *
+     * Temperature (in °C) = ( ( ( (ADC_VALUE) * (FVR / 1024) ) - 500 ) / 10 )
+     * SETUP FVR    = 2.048 V
+     * MEASURED FVR = 1.98  V
+     * ADC_VALUE - raw adc value from PIC
+     */
+    private float calibrateTMP36(int adc_value){
+        return (float) (((adc_value * 1.933) - 500 ) / 10);
+    }
+
+    private void  logDebugADC(){
+        Log.d(TAG,"ADC A5   = " + String.valueOf(adcA5));
+        Log.d(TAG,"ADC C3   = " + String.valueOf(adcC3));
+        Log.d(TAG,"ADC C3   = " + String.valueOf(adcC4));
+        Log.d(TAG,"ADC C3   = " + String.valueOf(adcC5));
+    }
+    /**
+     * Getters
+     * @return - adc values
+     */
+    public int getAdcA5(){ return adcA5; }
 
     public int getAdc3() {
         return adcC3;
@@ -444,7 +513,5 @@ public class I2cRpi3ToPic implements Runnable{
     public int getAdc5() {
         return adcC5;
     }
-
-    public int getAdcTmpDie() { return  adcTmpDie;}
 
 }
